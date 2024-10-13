@@ -4,17 +4,17 @@
 
 Yuki Nishidate and Issei Fujishiro. 2024. Efficient Particle-Based Fluid Surface Reconstruction Using Mesh Shaders and Bidirectional Two-Level Grids. Proc. ACM Comput. Graph. Interact. Tech. 7, 1, Article 1 (May 2024), 14 pages. https://doi.org/10.1145/3651285
 
+# Download assets
+
+Download the sample fluid data from this [Google Drive link](https://drive.google.com/file/d/1ngtwa0jLDxQw0gbhnUCg9uVrHiNUn9_f/view?usp=drive_link), unzip it and place the contents into `asset/FluidBench.abc`.
+
 # Build
 
 ```sh
-# Clone (Maybe it will take a long time)
-# If you get an error, try installing Git LFS
+# Clone
 git clone https://github.com/yknishidate/mesh_shader_surface_reconstruction
 cd mesh_shader_surface_reconstruction
 git submodule update --init --recursive
-
-# !IMPORTANT!
-# Please unzip the contents of 'asset/FluidBeach.zip' under 'asset/'
 
 # Generate a project
 cmake . -B build -DCMAKE_TOOLCHAIN_FILE=vcpkg/scripts/buildsystems/vcpkg.cmake
