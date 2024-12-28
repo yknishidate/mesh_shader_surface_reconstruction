@@ -3,4 +3,3 @@ bin
 .vscode
 spv/
 *.abc
-venv
