@@ -1,0 +1,219 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+
+#include "shared.glsl"
+#include "marching_cubes_table.glsl"
+#include "kernel.glsl"
+
+layout(local_size_x = 32) in;
+
+float getDensity(uvec3 indices){
+    return densities[to1D(indices, N + 1)];
+}
+
+void checkSurfaceCell(uint cellIndex, uvec3 cellIndices){
+    // NOTE: If the particleCount == 0, it could still be a surface.
+    // NOTE: The boundary cell shall not be a surface.
+    if(!isBoundary(cellIndices, N) && isSurface(cellIndices, N)){
+        uint particleCount = bottomParticleCounts[cellIndex];
+        particleCount = min(particleCount, maxParticlesPerCell);
+
+        uint cellOffset = atomicAdd(surfaceCellCount, 1);
+        uint particleOffset = atomicAdd(surfaceParticleCount, particleCount);
+
+        surfaceCells[cellOffset] = cellIndex;
+
+        // [2]
+        atomicMax(dispatchCommand.counts[marchingCubesCommandIndex].x, divRoundUp(cellOffset + 1, 32));
+        dispatchCommand.counts[marchingCubesCommandIndex].y = 1;
+        dispatchCommand.counts[marchingCubesCommandIndex].z = 1;
+        dispatchCommand.counts[marchingCubesCommandIndex].w = 0;
+        
+        // Write surface vertices at the same time
+        surfaceVertices[to1D(cellIndices + uvec3(0, 0, 0), N + 1)] = 1;
+        surfaceVertices[to1D(cellIndices + uvec3(1, 0, 0), N + 1)] = 1;
+        surfaceVertices[to1D(cellIndices + uvec3(0, 1, 0), N + 1)] = 1;
+        surfaceVertices[to1D(cellIndices + uvec3(1, 1, 0), N + 1)] = 1;
+        surfaceVertices[to1D(cellIndices + uvec3(0, 0, 1), N + 1)] = 1;
+        surfaceVertices[to1D(cellIndices + uvec3(1, 0, 1), N + 1)] = 1;
+        surfaceVertices[to1D(cellIndices + uvec3(0, 1, 1), N + 1)] = 1;
+        surfaceVertices[to1D(cellIndices + uvec3(1, 1, 1), N + 1)] = 1;
+    }
+}
+
+// [surfaceVertexCount, 1, 1] indirect
+void main_normal()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint vertexIndex = compressedVertices[gid];
+    if(gid >= surfaceVertexCount){
+        return;
+    }
+    uvec3 vertexIndices = to3D(vertexIndex, N + 1);
+    uint i = vertexIndices.x;
+    uint j = vertexIndices.y;
+    uint k = vertexIndices.z;
+    
+    // TODO: treat zero
+    vec3 normal;
+    normal.x = getDensity(uvec3(i + 1, j, k)) - getDensity(uvec3(i - 1, j, k)) / cellSize.x;
+    normal.y = getDensity(uvec3(i, j + 1, k)) - getDensity(uvec3(i, j - 1, k)) / cellSize.y;
+    normal.z = getDensity(uvec3(i, j, k + 1)) - getDensity(uvec3(i, j, k - 1)) / cellSize.z;
+    normal = normalize(normal);
+    
+    cellVertexNormals[vertexIndex] = vec4(normal, 1.0);
+}
+
+// Compress surface vertices
+// [numVertices, 1, 1]
+void main_vertex_compress()
+{
+    uint vertexIndex = gl_GlobalInvocationID.x;
+    // Exclude out of range
+    if(vertexIndex >= (N + 1) * (N + 1) * (N + 1)) {
+        return;
+    }
+
+    if(surfaceVertices[vertexIndex] == 1){
+        uint index = atomicAdd(surfaceVertexCount, 1);
+        uint drawCount = divRoundUp(index + 1, 32);
+        atomicMax(dispatchCommand.counts[densityCommandIndex].x, drawCount);
+        dispatchCommand.counts[densityCommandIndex].y = 1;
+        dispatchCommand.counts[densityCommandIndex].z = 1;
+        dispatchCommand.counts[densityCommandIndex].w = 0;
+        compressedVertices[index] = vertexIndex;
+    }
+}
+
+void main_surface_block()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint blockIndex = gl_GlobalInvocationID.x;
+    uvec3 blockIndices = to3D(blockIndex, M);
+    bool isOutOfRange = blockIndex >= numBlocks;
+    uint validCellCount = topValidCellCounts[blockIndex];
+    bool isValid = !isOutOfRange && isSurfaceBlock(validCellCount);
+
+    if(isValid){
+        uint globalOffset = atomicAdd(surfaceBlockCount, 1);
+        // drawCount = surfaceBlockCount * 2
+        uint dispatchCellCount = (globalOffset + 1) * KC;
+        uint drawCount = divRoundUp(dispatchCellCount, 32);
+        atomicMax(dispatchCommand.counts[surfaceCellWithBlockCommandIndex].x, drawCount);
+        dispatchCommand.counts[surfaceCellWithBlockCommandIndex].y = 1;
+        dispatchCommand.counts[surfaceCellWithBlockCommandIndex].z = 1;
+        dispatchCommand.counts[surfaceCellWithBlockCommandIndex].w = 0;
+        surfaceBlocks[globalOffset] = blockIndex;
+    }
+}
+
+void main_surface_cell()
+{
+    uint gid = gl_GlobalInvocationID.x;
+
+    // Get parent block index
+    uint blockIndex = surfaceBlocks[gid / KC];
+    uvec3 blockIndices = to3D(blockIndex, M);
+
+    // Get cell index
+    uint localCellIndex = gid % KC;
+    uvec3 localCellIndices = to3D(localCellIndex, K);
+
+    uvec3 cellIndices = blockIndices * uvec3(K) + localCellIndices;
+    uint cellIndex = to1D(cellIndices, N);
+
+    checkSurfaceCell(cellIndex, cellIndices);
+}
+
+// One thread called for each particle
+void main_fill_grids()
+{
+    uint particleIndex = gl_GlobalInvocationID.x;
+    vec3 worldPos = getParticlePosition(particleIndex);
+    if(particleIndex >= pushConstants.maxParticleCount || isOutOfArea(worldPos)){
+        return;
+    }
+
+    // Find the cell to which it belongs based on its position
+    uvec3 bottomIndices = worldPosToCellIndices(worldPos);
+    uint bottomIndex = to1D(bottomIndices, N);
+
+    // Store index in cell
+    uint particleIndexInCell = atomicAdd(bottomParticleCounts[bottomIndex], 1);
+    if(particleIndexInCell < maxParticlesPerCell){
+        bottomParticleIndices[bottomIndex * maxParticlesPerCell + particleIndexInCell] = particleIndex;
+    }
+
+    // TODO: Optimize this code
+    // If this is the first particle stored in that cell
+    // increment the block count
+    if(particleIndexInCell == 0){
+        uvec3 topIndices = bottomIndices / K;
+        uint topIndex = to1D(topIndices, M);
+        atomicAdd(topValidCellCounts[topIndex], 1);
+        
+        // If near a block boundary, also increment the count of the neighboring block
+        uvec3 bottomIndicesInBlock = bottomIndices % K;
+        bvec3 isBoundaryCellInBlockMinus = equal(bottomIndicesInBlock, uvec3(0));
+        bvec3 isBoundaryCellInBlockPlus = equal(bottomIndicesInBlock, uvec3(K - 1));
+
+        ivec3 offsets = ivec3(0); // offsets of block (not cell)
+        for(offsets.x = -1; offsets.x <= 1; offsets.x++){
+            for(offsets.y = -1; offsets.y <= 1; offsets.y++){
+                for(offsets.z = -1; offsets.z <= 1; offsets.z++){
+                    // skip this block
+                    if(offsets == ivec3(0)) continue;
+
+                    // check if the cell is on this block
+                    bool shouldAdd = true;
+                    for(int axis = 0; axis < 3; axis++){
+                        // minus
+                        if(offsets[axis] == -1 
+                           && !isBoundaryCellInBlockMinus[axis]){
+                            shouldAdd = false;
+                        }
+
+                        // plus
+                        else if(offsets[axis] == 1 
+                           && !isBoundaryCellInBlockPlus[axis]){
+                            shouldAdd = false;
+                        }
+                    }
+                    if(shouldAdd){
+                        ivec3 neighbor = ivec3(topIndices + offsets);
+                        if(!isOutOfRange(neighbor, M)){
+                            atomicAdd(topValidCellCounts[to1D(uvec3(neighbor), M)], 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Step 5. Compute densities
+// [numVertices, 1, 1]
+void main_density()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    uint vertexIndex = compressedVertices[gid];
+
+    // Exclude out of range
+    bool isValid = gid < surfaceVertexCount;
+    uint count = isValid ? 1 : 0;
+
+    uint totalCount = subgroupAdd(count);
+    if(tid == 0){
+        atomicAdd(densityCount, totalCount);
+    }
+    
+    if(isValid){
+        uvec3 vertexIndices = to3D(vertexIndex, N + 1);
+
+        // NOTE: density isn't compressed
+        densities[vertexIndex] = computeDensity(vertexIndices, N);
+    }
+}
+

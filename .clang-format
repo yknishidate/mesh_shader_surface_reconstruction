@@ -1,0 +1,13 @@
+BasedOnStyle: Chromium
+IndentWidth: 4
+TabWidth: 4
+ColumnLimit: 100
+UseTab: Never
+AccessModifierOffset: -4
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+  AfterStruct: true
+  SplitEmptyFunction: true
+AllowAllArgumentsOnNextLine: true
+BreakBeforeBinaryOperators: All

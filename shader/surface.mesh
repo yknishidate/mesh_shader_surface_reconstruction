@@ -1,0 +1,178 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+
+#include "shared.glsl"
+#include "marching_cubes_table.glsl"
+
+// max vertices: 60 + 60 + 50 = 170
+// max triangles: 4 * 32 = 128
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(triangles, max_vertices = 170, max_primitives = 128) out;
+
+layout(location = 0) out VertexOutput
+{
+    vec4 normal;
+    vec4 pos;
+#ifdef OUTPUT_MESHLET_INDEX
+    flat uint meshletIndex;
+#endif
+} vertexOutput[];
+
+vec3 computeMCVertexPosition(uint globalVertex0, uint globalVertex1, float t)
+{
+    vec3 pos0 = vec3(to3D(globalVertex0, N + 1));
+    vec3 pos1 = vec3(to3D(globalVertex1, N + 1));
+    return areaOrigin + cellSize * mix(pos0, pos1, t);
+}
+
+vec4 computeMCVertexNormal(uint globalVertex0, uint globalVertex1, float t)
+{
+    vec3 normal0 = cellVertexNormals[globalVertex0].xyz;
+    vec3 normal1 = cellVertexNormals[globalVertex1].xyz;
+    return vec4(-normalize(mix(normal0, normal1, t)), 1.0);
+}
+
+// Store the index of the output vertex in the edge index element
+// Invalid elements will be set to -1
+const uint numEdgesInBlock = 170;
+shared int mcVertexIndicesInBlock[numEdgesInBlock];
+
+// localCellIndex is the index within 4x4x4
+const int edgeOffsets[12] = int[](0, 61, 4, 60, 20, 81, 24, 80, 120, 121, 126, 125);
+uint cellEdgeToBlockEdge(uint localCellIndex, uint cellEdge, uint groupIndexInBlock){
+    localCellIndex -= groupIndexInBlock * 32;
+    uint firstEdge = localCellIndex % 16 + (localCellIndex / 16) * 20;
+    uvec3 localCellIndices = to3D(localCellIndex, K);
+    uint j = localCellIndices.y;
+    uint k = localCellIndices.z;
+
+    uint val = firstEdge + edgeOffsets[cellEdge];
+    if(cellEdge >= 8){
+        return val + j + 5 * k;
+    }else if(cellEdge % 2 == 1){
+        return val + j;
+    }
+    return val;
+}
+
+// Get the global grid vertex index of both endpoints from the edge index in the block
+// blockEdge:         [0, 169]
+// groupIndexInBlock: [0, 1]
+const uvec3 edgesSize[3] = uvec3[](uvec3(4, 5, 3), uvec3(5, 4, 3), uvec3(5, 5, 2));
+uvec2 getGridVertexIndicesFromBlockEdge(uvec3 blockIndices, uint blockEdge, uint groupIndexInBlock){
+    // Find the axis in which the edge extends
+    uint axis = blockEdge / 60;
+    uint indexInAxis = blockEdge % 60;
+
+    uvec3 size = edgesSize[axis];
+    uvec3 localVertexIndices;
+    localVertexIndices.x = indexInAxis % size.x;
+    localVertexIndices.y = (indexInAxis % (size.x * size.y)) / size.x;
+    localVertexIndices.z = indexInAxis / (size.x * size.y);
+    
+    // Find the global vertex index towards the starting point
+    // Consider groupIndexInBlock
+    uvec3 vertexIndices;
+    vertexIndices.x = blockIndices.x * K + localVertexIndices.x;
+    vertexIndices.y = blockIndices.y * K + localVertexIndices.y;
+    vertexIndices.z = blockIndices.z * K + localVertexIndices.z + groupIndexInBlock * 2;
+
+    uvec3 offset = uvec3(0);
+    offset[axis] = 1;
+
+    uvec2 vertices;
+    vertices[0] = to1D(vertexIndices, N + 1);          // Start
+    vertices[1] = to1D(vertexIndices + offset, N + 1); // End
+    return vertices;
+}
+
+// 32 threads are launched for each surface block
+// Each thread looks at different edges and cells
+void main_subgroup_per_block()
+{
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const float isoValue = pushConstants.isoValue;
+    
+    // Get parent block index (Two groups of the same block are invoked)
+    uint blockIndex = surfaceBlocks[gid / KC];
+    uvec3 blockIndices = to3D(blockIndex, M);
+
+    // Get the cell index within the block
+    // Separate the cell responsible for another group activated in the same block
+    uint localCellIndex = gid % KC;
+    uvec3 localCellIndices = to3D(localCellIndex, K);
+    uint groupIndexInBlock = localCellIndex < KC / 2 ? 0 : 1;
+
+    // Add vertices to edges
+    uint mcVertexCount = 0;
+    const int totalEdges = 170;
+    for(int i = 0; i < divRoundUp(totalEdges, 32); i++){
+        // Check index
+        uint edgeIndex = i * 32 + tid;
+        if(edgeIndex >= totalEdges) break;
+
+        uvec2 vertexIndices = getGridVertexIndicesFromBlockEdge(blockIndices, edgeIndex, groupIndexInBlock);
+        float dens0 = densities[vertexIndices[0]];
+        float dens1 = densities[vertexIndices[1]];
+        bool needVertex = dens0 > isoValue ^^ dens1 > isoValue;
+
+        uvec4 vote = subgroupBallot(needVertex);
+        uint offset = mcVertexCount + subgroupBallotExclusiveBitCount(vote);
+        mcVertexCount += subgroupBallotBitCount(vote);
+
+        if(needVertex){
+            // Interpolate vertex attributes
+            float t = computeInterpolationFactor(dens0, dens1);
+            vec3 position = computeMCVertexPosition(vertexIndices[0], vertexIndices[1], t);
+            vec4 normal = computeMCVertexNormal(vertexIndices[0], vertexIndices[1], t);
+            
+            // Store index to shared memory
+            mcVertexIndicesInBlock[edgeIndex] = int(offset);
+
+            // Output vertex attributes
+            gl_MeshVerticesEXT[offset].gl_Position = worldToNDC(position);
+            gl_MeshVerticesEXT[offset].gl_PointSize = 5.0;
+            vertexOutput[offset].normal = normal;
+            vertexOutput[offset].pos = vec4(position, 1.0);
+        #ifdef OUTPUT_MESHLET_INDEX
+            vertexOutput[offset].meshletIndex = gl_WorkGroupID.x;
+        #endif
+        } else {
+            mcVertexIndicesInBlock[edgeIndex] = -1;
+        }
+    }
+
+    if(mcVertexCount == 0){
+        SetMeshOutputsEXT(0, 0);
+        return;
+    }
+
+    uvec3 cellIndices = blockIndices * uvec3(K) + localCellIndices;
+    uint cellIndex = to1D(cellIndices, N);
+
+    // Compute MC case
+    uint mcCase = computeMarchingCubesCase(cellIndices);
+    uint numTris = triangleCounts[mcCase];
+    uint triangleOffset = subgroupExclusiveAdd(numTris);
+    uint totalTriangles = subgroupAdd(numTris);
+
+    // Output polygons
+    int table[] = triangleTable[mcCase];
+    for(int t = 0; t < numTris; t++){
+        ivec3 triangleVertices;
+        uvec3 debugBlockIndices;
+        for(int v = 0; v < 3; v++){
+            int cellEdgeIndex = table[t * 3 + v];
+            uint blockEdgeIndex = cellEdgeToBlockEdge(localCellIndex, cellEdgeIndex, groupIndexInBlock);
+            int vertexIndex = mcVertexIndicesInBlock[blockEdgeIndex];
+            triangleVertices[v] = vertexIndex;
+            debugBlockIndices[v] = blockEdgeIndex;
+        }
+        gl_PrimitiveTriangleIndicesEXT[triangleOffset + t] = uvec3(triangleVertices);
+    }
+    
+    SetMeshOutputsEXT(mcVertexCount, totalTriangles);
+}
